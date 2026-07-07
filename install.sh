@@ -1,7 +1,10 @@
 #!/bin/bash
 # ============================================================
-# 一键部署 DNS 解析服务器 (CoreDNS)
-# 目标: 让其他服务器把本机设置为 DNS 解析服务器
+# 一键部署 DNS 解析服务器 (CoreDNS + nftables 强制劫持)
+# 功能:
+#   1. CoreDNS 提供 DNS 解析/缓存
+#   2. nftables 劫持所有经过本机的 53 端口流量到本机 CoreDNS
+#   3. nftables NAT 让本机充当网关，其他服务器把网关指向本机即可强制走本机 DNS
 # 支持: Ubuntu / Debian / CentOS 8+ / Rocky / Alma
 # ============================================================
 
@@ -14,8 +17,18 @@ COREDNS_VERSION="${COREDNS_VERSION:-1.11.3}"
 DNS_PORT="${DNS_PORT:-53}"
 LISTEN_ADDR="${LISTEN_ADDR:-0.0.0.0}"
 UPSTREAM_DNS="${UPSTREAM_DNS:-223.5.5.5 223.6.6.6 119.29.29.29 8.8.8.8 1.1.1.1}"
+NFT_TABLE="dns_force"
 
-# 本地域名记录，可按需修改。格式: "域名 IP"
+# 是否启用 DNS 强制劫持（拦截其他服务器的 53 端口请求）
+FORCE_DNS="${FORCE_DNS:-true}"
+
+# 是否启用 NAT 网关（让本机充当其他服务器的网关）
+ENABLE_NAT="${ENABLE_NAT:-true}"
+
+# 外网网卡（留空自动检测）
+WAN_IFACE="${WAN_IFACE:-}"
+
+# 本地域名记录，格式: "域名 IP"
 LOCAL_RECORDS=(
     # "git.local 192.168.1.10"
     # "nas.local 192.168.1.20"
@@ -66,18 +79,29 @@ detect_arch() {
     log_info "检测到架构: ${machine} -> ${COREDNS_ARCH}"
 }
 
+detect_wan_iface() {
+    if [ -z "${WAN_IFACE}" ]; then
+        WAN_IFACE=$(ip route | awk '/^default/ {print $5; exit}')
+    fi
+    if [ -z "${WAN_IFACE}" ]; then
+        log_warn "未检测到默认外网网卡，NAT 功能可能不完整"
+    else
+        log_info "外网网卡: ${WAN_IFACE}"
+    fi
+}
+
 install_dependencies() {
     log_step "安装依赖..."
     case "${OS_ID}" in
         ubuntu|debian)
             apt-get update -y
-            DEBIAN_FRONTEND=noninteractive apt-get install -y curl tar ca-certificates dnsutils
+            DEBIAN_FRONTEND=noninteractive apt-get install -y curl tar ca-certificates dnsutils nftables iproute2
             ;;
         centos|rocky|almalinux|rhel)
             if command -v dnf >/dev/null 2>&1; then
-                dnf install -y curl tar ca-certificates bind-utils
+                dnf install -y curl tar ca-certificates bind-utils nftables iproute
             else
-                yum install -y curl tar ca-certificates bind-utils
+                yum install -y curl tar ca-certificates bind-utils nftables iproute
             fi
             ;;
         *)
@@ -178,27 +202,79 @@ EOF
     systemctl restart "${SERVICE_NAME}"
 }
 
+enable_ip_forward() {
+    log_step "启用 IPv4 转发..."
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null
+    if grep -q "^net.ipv4.ip_forward" /etc/sysctl.conf; then
+        sed -i 's/^net.ipv4.ip_forward.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf
+    else
+        echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+    fi
+    log_info "IPv4 转发已启用"
+}
+
+setup_nftables() {
+    log_step "配置 nftables (DNS 劫持 + NAT)..."
+
+    systemctl enable nftables >/dev/null 2>&1 || true
+    systemctl start nftables >/dev/null 2>&1 || true
+
+    # 删除旧表（如果存在）
+    nft delete table inet "${NFT_TABLE}" 2>/dev/null || true
+
+    local server_ip
+    server_ip=$(get_server_ip)
+
+    nft -f - <<EOF
+add table inet ${NFT_TABLE}
+add chain inet ${NFT_TABLE} prerouting { type nat hook prerouting priority -100; policy accept; }
+add chain inet ${NFT_TABLE} postrouting { type nat hook postrouting priority 100; policy accept; }
+add chain inet ${NFT_TABLE} forward { type filter hook forward priority 0; policy accept; }
+
+# DNS 劫持：所有经过本机的 53 端口请求强制转到本机 CoreDNS
+add rule inet ${NFT_TABLE} prerouting udp dport 53 dnat to ${server_ip}:${DNS_PORT}
+add rule inet ${NFT_TABLE} prerouting tcp dport 53 dnat to ${server_ip}:${DNS_PORT}
+
+# NAT 网关：允许其他服务器通过本机上网
+add rule inet ${NFT_TABLE} forward ct state established,related accept
+add rule inet ${NFT_TABLE} forward iifname != "${WAN_IFACE}" accept
+add rule inet ${NFT_TABLE} postrouting oifname "${WAN_IFACE}" masquerade
+EOF
+
+    # 持久化
+    nft list ruleset > /etc/nftables.conf
+    systemctl enable nftables >/dev/null 2>&1 || true
+
+    log_info "nftables DNS 劫持已配置"
+    log_info "  所有 53 端口请求 -> ${server_ip}:${DNS_PORT}"
+    if [ "${ENABLE_NAT}" = "true" ] && [ -n "${WAN_IFACE}" ]; then
+        log_info "  NAT 网关已启用 (${WAN_IFACE})"
+    fi
+}
+
 open_firewall() {
     log_step "尝试放行 DNS 端口 ${DNS_PORT}..."
     if command -v ufw >/dev/null 2>&1; then
         ufw allow "${DNS_PORT}"/udp || true
         ufw allow "${DNS_PORT}"/tcp || true
+        sed -i 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw 2>/dev/null || true
     fi
     if command -v firewall-cmd >/dev/null 2>&1; then
         firewall-cmd --permanent --add-port="${DNS_PORT}"/udp 2>/dev/null || true
         firewall-cmd --permanent --add-port="${DNS_PORT}"/tcp 2>/dev/null || true
+        firewall-cmd --permanent --add-masquerade 2>/dev/null || true
         firewall-cmd --reload 2>/dev/null || true
     fi
 }
 
 get_server_ip() {
     local ip
-    ip=$(curl -fsS --connect-timeout 3 https://api.ipify.org 2>/dev/null || true)
-    if [ -z "${ip}" ]; then
-        ip=$(ip route get 1.1.1.1 2>/dev/null | awk '/src/ {for (i=1;i<=NF;i++) if ($i=="src") print $(i+1)}' | head -1 || true)
-    fi
+    ip=$(ip route get 1.1.1.1 2>/dev/null | awk '/src/ {for (i=1;i<=NF;i++) if ($i=="src") print $(i+1)}' | head -1 || true)
     if [ -z "${ip}" ]; then
         ip=$(hostname -I 2>/dev/null | awk '{print $1}' || true)
+    fi
+    if [ -z "${ip}" ]; then
+        ip=$(curl -fsS --connect-timeout 3 https://api.ipify.org 2>/dev/null || true)
     fi
     echo "${ip:-127.0.0.1}"
 }
@@ -219,18 +295,32 @@ verify() {
         dig @"${server_ip}" +short +time=3 example.com >/dev/null 2>&1 && log_info "DNS 解析测试通过" || log_warn "DNS 解析测试未通过，请检查安全组/防火墙"
     fi
 
+    if nft list table inet "${NFT_TABLE}" >/dev/null 2>&1; then
+        log_info "nftables 劫持规则已生效"
+    else
+        log_warn "nftables 劫持规则未检测到"
+    fi
+
     echo ""
     log_info "=================================================="
-    log_info "  DNS 解析服务器部署完成"
+    log_info "  DNS 解析服务器部署完成 (强制劫持模式)"
     log_info "=================================================="
     log_info "  DNS 地址: ${endpoint}"
-    log_info "  其他服务器 nameserver: ${server_ip}"
+    log_info "  DNS 劫持: 已启用 (所有 53 端口请求强制转到本机)"
+    log_info "  NAT 网关: ${ENABLE_NAT}"
     log_info "  上游 DNS: ${UPSTREAM_DNS}"
     log_info "  配置文件: ${APP_DIR}/Corefile"
     log_info "=================================================="
     echo ""
-    echo "其他服务器配置示例:"
+    log_info "其他服务器配置方式（二选一）："
+    echo ""
+    log_info "方式1: 仅设置 DNS（软强制）"
     echo "  echo 'nameserver ${server_ip}' | sudo tee /etc/resolv.conf"
+    echo ""
+    log_info "方式2: 设置网关 + DNS（硬强制，推荐）"
+    echo "  sudo ip route replace default via ${server_ip}"
+    echo "  echo 'nameserver ${server_ip}' | sudo tee /etc/resolv.conf"
+    echo "  # 这样即使其他服务器写了 8.8.8.8，DNS 请求也会被劫持到本机"
     echo ""
     echo "${endpoint}"
 }
@@ -238,17 +328,20 @@ verify() {
 main() {
     echo ""
     log_info "##################################################"
-    log_info "#  DNS 解析服务器一键安装脚本"
+    log_info "#  DNS 解析服务器一键安装 (CoreDNS + nftables)"
     log_info "##################################################"
     echo ""
 
     require_root
     detect_os
     detect_arch
+    detect_wan_iface
     install_dependencies
     install_coredns
     write_coredns_config
     write_systemd_service
+    enable_ip_forward
+    setup_nftables
     open_firewall
     verify
 }
