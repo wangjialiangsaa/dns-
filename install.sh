@@ -232,8 +232,8 @@ add chain inet ${NFT_TABLE} postrouting { type nat hook postrouting priority 100
 add chain inet ${NFT_TABLE} forward { type filter hook forward priority 0; policy accept; }
 
 # DNS 劫持：所有经过本机的 53 端口请求强制转到本机 CoreDNS
-add rule inet ${NFT_TABLE} prerouting udp dport 53 dnat to ${server_ip}:${DNS_PORT}
-add rule inet ${NFT_TABLE} prerouting tcp dport 53 dnat to ${server_ip}:${DNS_PORT}
+add rule inet ${NFT_TABLE} prerouting udp dport 53 dnat ip to ${server_ip}:${DNS_PORT}
+add rule inet ${NFT_TABLE} prerouting tcp dport 53 dnat ip to ${server_ip}:${DNS_PORT}
 
 # NAT 网关：允许其他服务器通过本机上网
 add rule inet ${NFT_TABLE} forward ct state established,related accept
