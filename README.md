@@ -16,7 +16,7 @@
 ## 一键安装
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/bdauxuan202-gif/dns%E8%A7%A3%E6%9E%90/main/install.sh -o install.sh
+curl -fsSL https://raw.githubusercontent.com/wangjialiangsaa/dns-/main/install.sh -o install.sh
 chmod +x install.sh
 sudo ./install.sh
 ```
@@ -106,7 +106,7 @@ cat /etc/coredns/hosts
 ## 一键卸载
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/bdauxuan202-gif/dns%E8%A7%A3%E6%9E%90/main/uninstall.sh -o uninstall.sh
+curl -fsSL https://raw.githubusercontent.com/wangjialiangsaa/dns-/main/uninstall.sh -o uninstall.sh
 chmod +x uninstall.sh
 sudo ./uninstall.sh
 ```
