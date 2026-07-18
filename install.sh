@@ -20,6 +20,7 @@
 # 用法:
 #   sudo ./install.sh                                  # 默认 simple 模式
 #   ALLOW_IPS="1.2.3.4 5.6.7.8" sudo -E ./install.sh   # 放行指定公网客户端
+#   AUTO_ALLOW=true sudo -E ./install.sh               # 自动放行任何客户端(带限速，推荐公网用)
 #   RESTRICT_DNS=false sudo -E ./install.sh            # 完全开放(慎用，见下方安全提示)
 #   MODE=gateway sudo -E ./install.sh                  # 强制劫持模式
 #   DNS_PORT=53 UPSTREAM_DNS="1.1.1.1 8.8.8.8" sudo -E ./install.sh
@@ -57,6 +58,9 @@ ALLOW_NETS="${ALLOW_NETS:-192.168.0.0/16 10.0.0.0/8 172.16.0.0/12 127.0.0.0/8}"
 # 额外放行的具体客户端 IP（公网服务器写这里，空格分隔，可带 /32 或纯 IP）
 ALLOW_IPS="${ALLOW_IPS:-}"
 RESTRICT_DNS="${RESTRICT_DNS:-true}"    # true=仅允许 ALLOW_NETS/ALLOW_IPS 查询；false=对所有来源开放
+# 自动放行：无需手填 IP，对所有来源开放，但按源 IP 限速，避免沦为可滥用的开放解析器
+AUTO_ALLOW="${AUTO_ALLOW:-false}"       # true=自动放行任何客户端（配合限速）
+RATE_LIMIT="${RATE_LIMIT:-30}"          # 每源 IP 每秒最大查询数（AUTO_ALLOW 时生效，0=不限速）
 
 # 本地域名记录，格式: "域名 IP"
 LOCAL_RECORDS=(
@@ -418,7 +422,8 @@ setup_gateway_nft(){
 
 # ---------- simple 模式: 仅 DNS 访问控制 ----------
 setup_simple_acl(){
-    if [[ "${RESTRICT_DNS}" != "true" ]]; then
+    # 自动放行模式即使 RESTRICT_DNS=false 也要建规则（限速需要 nftables）
+    if [[ "${RESTRICT_DNS}" != "true" && "${AUTO_ALLOW}" != "true" ]]; then
         log_info "RESTRICT_DNS=false，跳过 nftables ACL"
         return
     fi
@@ -433,25 +438,58 @@ setup_simple_acl(){
     rules="add table inet ${NFT_TABLE}\n"
     rules+="add chain inet ${NFT_TABLE} input { type filter hook input priority -10; policy accept; }\n"
     rules+="add rule inet ${NFT_TABLE} input iifname \"lo\" accept\n"
-    for net in ${ALLOW_NETS}; do
-        [[ -z "${net// }" ]] && continue
-        rules+="add rule inet ${NFT_TABLE} input ip saddr ${net} udp dport ${DNS_PORT} accept\n"
-        rules+="add rule inet ${NFT_TABLE} input ip saddr ${net} tcp dport ${DNS_PORT} accept\n"
-    done
-    for cip in ${ALLOW_IPS}; do
-        [[ -z "${cip// }" ]] && continue
-        rules+="add rule inet ${NFT_TABLE} input ip saddr ${cip} udp dport ${DNS_PORT} accept\n"
-        rules+="add rule inet ${NFT_TABLE} input ip saddr ${cip} tcp dport ${DNS_PORT} accept\n"
-        log_info "放行客户端 IP: ${cip}"
-    done
-    rules+="add rule inet ${NFT_TABLE} input udp dport ${DNS_PORT} drop\n"
-    rules+="add rule inet ${NFT_TABLE} input tcp dport ${DNS_PORT} drop\n"
+
+    # ---- 自动放行模式：不用手填 IP，任何客户端都能解析；按源 IP 限速防滥用 ----
+    if [[ "${AUTO_ALLOW}" == "true" ]]; then
+        # 内网段永远无条件放行（自己人不限速）
+        for net in ${ALLOW_NETS}; do
+            [[ -z "${net// }" ]] && continue
+            rules+="add rule inet ${NFT_TABLE} input ip saddr ${net} udp dport ${DNS_PORT} accept\n"
+            rules+="add rule inet ${NFT_TABLE} input ip saddr ${net} tcp dport ${DNS_PORT} accept\n"
+        done
+        # 手动指定的 IP 也无条件放行
+        for cip in ${ALLOW_IPS}; do
+            [[ -z "${cip// }" ]] && continue
+            rules+="add rule inet ${NFT_TABLE} input ip saddr ${cip} udp dport ${DNS_PORT} accept\n"
+            rules+="add rule inet ${NFT_TABLE} input ip saddr ${cip} tcp dport ${DNS_PORT} accept\n"
+            log_info "放行客户端 IP: ${cip}"
+        done
+        # 其余所有来源：放行但限速（meter 按源 IP 独立计数），防止被拿去做 DNS 放大攻击
+        if [[ "${RATE_LIMIT}" -gt 0 ]] 2>/dev/null; then
+            rules+="add rule inet ${NFT_TABLE} input udp dport ${DNS_PORT} meter dns_rate_u { ip saddr limit rate over ${RATE_LIMIT}/second } drop\n"
+            rules+="add rule inet ${NFT_TABLE} input tcp dport ${DNS_PORT} meter dns_rate_t { ip saddr limit rate over ${RATE_LIMIT}/second } drop\n"
+            log_info "自动放行：所有客户端可解析，每源 IP 限速 ${RATE_LIMIT} 次/秒"
+        else
+            log_warn "自动放行且未限速 (RATE_LIMIT=0)：等同开放解析器，建议开启限速"
+        fi
+        rules+="add rule inet ${NFT_TABLE} input udp dport ${DNS_PORT} accept\n"
+        rules+="add rule inet ${NFT_TABLE} input tcp dport ${DNS_PORT} accept\n"
+    else
+        # ---- 白名单模式：仅放行内网段与手填 IP，其余 drop ----
+        for net in ${ALLOW_NETS}; do
+            [[ -z "${net// }" ]] && continue
+            rules+="add rule inet ${NFT_TABLE} input ip saddr ${net} udp dport ${DNS_PORT} accept\n"
+            rules+="add rule inet ${NFT_TABLE} input ip saddr ${net} tcp dport ${DNS_PORT} accept\n"
+        done
+        for cip in ${ALLOW_IPS}; do
+            [[ -z "${cip// }" ]] && continue
+            rules+="add rule inet ${NFT_TABLE} input ip saddr ${cip} udp dport ${DNS_PORT} accept\n"
+            rules+="add rule inet ${NFT_TABLE} input ip saddr ${cip} tcp dport ${DNS_PORT} accept\n"
+            log_info "放行客户端 IP: ${cip}"
+        done
+        rules+="add rule inet ${NFT_TABLE} input udp dport ${DNS_PORT} drop\n"
+        rules+="add rule inet ${NFT_TABLE} input tcp dport ${DNS_PORT} drop\n"
+    fi
 
     # shellcheck disable=SC2059
     printf "%b" "${rules}" | nft -f - || die "nftables 规则应用失败"
 
     persist_nft
-    log_ok "DNS 仅允许来自网段: ${ALLOW_NETS}${ALLOW_IPS:+ ；IP: ${ALLOW_IPS}}"
+    if [[ "${AUTO_ALLOW}" == "true" ]]; then
+        log_ok "DNS 自动放行所有客户端${RATE_LIMIT:+（限速 ${RATE_LIMIT}/s/IP）}"
+    else
+        log_ok "DNS 仅允许来自网段: ${ALLOW_NETS}${ALLOW_IPS:+ ；IP: ${ALLOW_IPS}}"
+    fi
 }
 
 # ---------- 持久化 nftables 规则 ----------
@@ -568,9 +606,17 @@ EOF
         echo -e "  ${B}sudo ./client-setup.sh ${server_ip}${N}" >&2
         echo "  或手动: echo 'nameserver ${server_ip}' | sudo tee /etc/resolv.conf" >&2
         echo "" >&2
-        if [[ "${RESTRICT_DNS}" == "true" ]]; then
-            log_warn "当前仅放行内网段与 ALLOW_IPS。若客户端是公网服务器，需先放行其公网 IP："
-            echo "  ALLOW_IPS=\"客户端公网IP\" sudo -E ./install.sh   # 可空格分隔多个" >&2
+        if [[ "${AUTO_ALLOW}" == "true" ]]; then
+            log_ok "自动放行已开启：任何指向本机的客户端都能直接解析，无需手填 IP"
+            if [[ "${RATE_LIMIT}" -gt 0 ]] 2>/dev/null; then
+                echo "  每源 IP 限速: ${RATE_LIMIT} 次/秒（防 DNS 放大滥用）" >&2
+            else
+                log_warn "  当前未限速 (RATE_LIMIT=0)，等同开放解析器，建议设置 RATE_LIMIT"
+            fi
+        elif [[ "${RESTRICT_DNS}" == "true" ]]; then
+            log_warn "当前仅放行内网段与 ALLOW_IPS。若客户端是公网服务器，二选一："
+            echo "  ① 自动放行(推荐，免填IP): AUTO_ALLOW=true sudo -E ./install.sh" >&2
+            echo "  ② 手填白名单:            ALLOW_IPS=\"客户端公网IP\" sudo -E ./install.sh" >&2
             echo "  已放行网段: ${ALLOW_NETS}" >&2
             [[ -n "${ALLOW_IPS}" ]] && echo "  已放行IP:   ${ALLOW_IPS}" >&2
         else
