@@ -2,28 +2,34 @@
 # ============================================================
 # 一键部署 DNS 解析服务器 (CoreDNS + nftables)
 #
+# 让其他服务器把本机当作 DNS 解析服务器使用：
+# 它们只需把 nameserver 指向本机 IP 即可（在客户端 /etc/resolv.conf 或
+# 用配套的 client-setup.sh 一键配置）。
+#
 # 两种模式:
-#   MODE=gateway (默认) —— 强制劫持模式
-#       CoreDNS 解析/缓存 + nftables 劫持所有经过本机的 53 端口流量
-#       + NAT 网关。其他服务器把默认网关指向本机，即可强制走本机 DNS，
-#       即便它们写死 8.8.8.8 也会被劫持到本机 CoreDNS。
-#   MODE=simple —— 仅 DNS 模式
-#       CoreDNS 解析/缓存 + nftables 访问控制(ACL)，不做 NAT/劫持。
-#       其他服务器把 nameserver 指向本机即可（软强制）。
+#   MODE=simple (默认) —— 仅 DNS 模式【推荐，最常用】
+#       CoreDNS 解析/缓存 + nftables 访问控制(ACL)。其他服务器把
+#       nameserver 指向本机即可解析。默认只放行内网网段，公网客户端
+#       请用 ALLOW_IPS 把它们的 IP 加进白名单。
+#   MODE=gateway —— 强制劫持模式【进阶，需要改客户端网关】
+#       在 simple 基础上再用 nftables 劫持所有经过本机的 53 流量 + NAT。
+#       其他服务器把默认网关指向本机后，即使写死 8.8.8.8 也会被劫持到本机。
 #
 # 支持: Ubuntu / Debian / CentOS 8+ / Rocky / Alma / Fedora
 #
 # 用法:
-#   sudo ./install.sh
-#   MODE=simple sudo -E ./install.sh
+#   sudo ./install.sh                                  # 默认 simple 模式
+#   ALLOW_IPS="1.2.3.4 5.6.7.8" sudo -E ./install.sh   # 放行指定公网客户端
+#   RESTRICT_DNS=false sudo -E ./install.sh            # 完全开放(慎用，见下方安全提示)
+#   MODE=gateway sudo -E ./install.sh                  # 强制劫持模式
 #   DNS_PORT=53 UPSTREAM_DNS="1.1.1.1 8.8.8.8" sudo -E ./install.sh
 # ============================================================
 
 set -euo pipefail
 
 # ===================== 可配置项（均可用环境变量覆盖） =====================
-# 部署模式: gateway(强制劫持+NAT) | simple(仅DNS+ACL)
-MODE="${MODE:-gateway}"
+# 部署模式: simple(仅DNS+ACL，默认) | gateway(强制劫持+NAT)
+MODE="${MODE:-simple}"
 
 SERVICE_NAME="coredns"
 APP_DIR="/etc/coredns"
@@ -46,9 +52,11 @@ ENABLE_NAT="${ENABLE_NAT:-true}"        # 是否启用 NAT 网关（让本机充
 WAN_IFACE="${WAN_IFACE:-}"              # 外网网卡（留空自动检测）
 
 # simple 模式相关
-# 允许查询本 DNS 的源网段（写入 nftables ACL）
+# 允许查询本 DNS 的源网段（写入 nftables ACL），默认放行常见内网段
 ALLOW_NETS="${ALLOW_NETS:-192.168.0.0/16 10.0.0.0/8 172.16.0.0/12 127.0.0.0/8}"
-RESTRICT_DNS="${RESTRICT_DNS:-true}"    # simple 模式下是否仅允许 ALLOW_NETS 查询
+# 额外放行的具体客户端 IP（公网服务器写这里，空格分隔，可带 /32 或纯 IP）
+ALLOW_IPS="${ALLOW_IPS:-}"
+RESTRICT_DNS="${RESTRICT_DNS:-true}"    # true=仅允许 ALLOW_NETS/ALLOW_IPS 查询；false=对所有来源开放
 
 # 本地域名记录，格式: "域名 IP"
 LOCAL_RECORDS=(
@@ -421,13 +429,20 @@ setup_simple_acl(){
     systemctl start nftables >/dev/null 2>&1 || true
     nft delete table inet "${NFT_TABLE}" 2>/dev/null || true
 
-    local rules net
+    local rules net cip
     rules="add table inet ${NFT_TABLE}\n"
     rules+="add chain inet ${NFT_TABLE} input { type filter hook input priority -10; policy accept; }\n"
     rules+="add rule inet ${NFT_TABLE} input iifname \"lo\" accept\n"
     for net in ${ALLOW_NETS}; do
+        [[ -z "${net// }" ]] && continue
         rules+="add rule inet ${NFT_TABLE} input ip saddr ${net} udp dport ${DNS_PORT} accept\n"
         rules+="add rule inet ${NFT_TABLE} input ip saddr ${net} tcp dport ${DNS_PORT} accept\n"
+    done
+    for cip in ${ALLOW_IPS}; do
+        [[ -z "${cip// }" ]] && continue
+        rules+="add rule inet ${NFT_TABLE} input ip saddr ${cip} udp dport ${DNS_PORT} accept\n"
+        rules+="add rule inet ${NFT_TABLE} input ip saddr ${cip} tcp dport ${DNS_PORT} accept\n"
+        log_info "放行客户端 IP: ${cip}"
     done
     rules+="add rule inet ${NFT_TABLE} input udp dport ${DNS_PORT} drop\n"
     rules+="add rule inet ${NFT_TABLE} input tcp dport ${DNS_PORT} drop\n"
@@ -436,7 +451,7 @@ setup_simple_acl(){
     printf "%b" "${rules}" | nft -f - || die "nftables 规则应用失败"
 
     persist_nft
-    log_ok "DNS 仅允许来自: ${ALLOW_NETS}"
+    log_ok "DNS 仅允许来自网段: ${ALLOW_NETS}${ALLOW_IPS:+ ；IP: ${ALLOW_IPS}}"
 }
 
 # ---------- 持久化 nftables 规则 ----------
@@ -549,9 +564,18 @@ EOF
         echo "  echo 'nameserver ${server_ip}' | sudo tee /etc/resolv.conf" >&2
         echo "  # 即使客户端写死 8.8.8.8，53 请求也会被本机劫持" >&2
     else
-        log_info "其他服务器只需把 DNS 指过来（软强制）:"
+        log_info "其他服务器把本机当 DNS 用（在客户端执行）:"
         echo -e "  ${B}sudo ./client-setup.sh ${server_ip}${N}" >&2
         echo "  或手动: echo 'nameserver ${server_ip}' | sudo tee /etc/resolv.conf" >&2
+        echo "" >&2
+        if [[ "${RESTRICT_DNS}" == "true" ]]; then
+            log_warn "当前仅放行内网段与 ALLOW_IPS。若客户端是公网服务器，需先放行其公网 IP："
+            echo "  ALLOW_IPS=\"客户端公网IP\" sudo -E ./install.sh   # 可空格分隔多个" >&2
+            echo "  已放行网段: ${ALLOW_NETS}" >&2
+            [[ -n "${ALLOW_IPS}" ]] && echo "  已放行IP:   ${ALLOW_IPS}" >&2
+        else
+            log_warn "RESTRICT_DNS=false：当前对所有来源开放，属于开放解析器，务必用安全组收紧来源！"
+        fi
     fi
     echo "" >&2
     log_warn "云服务器安全组请放行 UDP/TCP ${DNS_PORT}"
